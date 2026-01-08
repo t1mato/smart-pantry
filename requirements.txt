@@ -1,0 +1,30 @@
+# Core LangChain framework
+langchain
+langchain-community
+
+# Vector database
+chromadb
+langchain-chroma
+
+# Local embeddings (no API costs, no rate limits)
+# Note: sentence-transformers 3.0.1 is pinned to avoid PyTorch compatibility issues
+sentence-transformers==3.0.1
+langchain-huggingface
+
+# LLM integration (for query/generation phase)
+langchain-google-genai
+
+# Frontend
+streamlit
+
+# Document processing
+pypdf
+
+# Environment management
+python-dotenv
+
+# Progress bars for better UX
+tqdm
+
+# Tokenization (for OpenAI compatibility if needed)
+tiktoken
