@@ -34,3 +34,8 @@ rank-bm25
 # Scientific computing (NumPy <2.0 for sentence-transformers compatibility)
 numpy<2.0
 scikit-learn
+
+# RAG Evaluation
+ragas
+datasets
+pandas
