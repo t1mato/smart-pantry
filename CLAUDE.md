@@ -4,13 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Smart Pantry is a RAG application for recipe discovery from PDF cookbooks. It uses local HuggingFace embeddings for vector search and Google Gemini for recipe adaptation.
+Smart Pantry is an advanced RAG application for recipe discovery from PDF cookbooks. Features **hybrid search** (BM25 + Semantic), **cross-encoder reranking**, and **RAGAS evaluation framework**.
 
 ## Architecture
 
-### Two-Phase System
+### Three-Phase System
 1. **Ingestion** (`ingest.py`): PDF → text chunks → local embeddings → ChromaDB
-2. **Query** (`app.py`): user query → vector search → context → Gemini → formatted recipe
+2. **Hybrid Retrieval** (`app.py`): BM25 + Semantic → RRF fusion → cross-encoder reranking (optional)
+3. **Generation** (`app.py`): Context → Gemini → formatted recipe
+4. **Evaluation** (`evaluation.py`): RAGAS metrics via Groq API
 
 ### Key Components
 
@@ -35,6 +37,26 @@ Smart Pantry is a RAG application for recipe discovery from PDF cookbooks. It us
 - PDFs loaded via `PyPDFLoader` from `data/` directory
 - `RecursiveCharacterTextSplitter` with recipe-specific separators: `["\n\n", "Title:", "Ingredients:"]`
 - Preserves recipe structure (title, ingredients, instructions)
+
+**Hybrid Search (app.py)**
+- **BM25 Retriever**: Keyword-based search using `rank-bm25` library
+- **Semantic Retriever**: ChromaDB vector similarity search
+- **RRF Fusion**: Reciprocal Rank Fusion combines both result sets
+- Equal weighting (50/50) between BM25 and semantic
+
+**Cross-Encoder Reranking (app.py)**
+- Model: `cross-encoder/ms-marco-MiniLM-L-6-v2`
+- Retrieves top 10 candidates from RRF fusion
+- Reranks with cross-encoder scores
+- Returns top 5 for LLM generation
+- **Improvement**: +6.1% answer relevancy (RAGAS evaluated)
+
+**RAGAS Evaluation (evaluation.py)**
+- Framework: RAGAS v0.3 (legacy API for LangChain compatibility)
+- LLM: Groq `llama-3.1-8b-instant` (fast, free tier)
+- Metrics: Context Precision, Context Recall, Faithfulness, Answer Relevancy
+- Evaluates 4 methods: Semantic Only, BM25 Only, Hybrid (RRF), Hybrid + Reranking
+- **Critical Fix**: `AnswerRelevancy(strictness=1)` for Groq n=1 compatibility
 
 ## Development Commands
 
@@ -66,6 +88,19 @@ streamlit run app.py
 
 **URL:** http://localhost:8501
 
+### Run RAGAS Evaluation
+```bash
+# Requires GROQ_API_KEY in .env
+python evaluation.py
+```
+
+**Output**:
+- `evaluation_results.csv` - Raw metric scores
+- `evaluation_results_report.txt` - Auto-generated summary
+- Duration: ~35 minutes for 3 test cases × 4 methods
+
+**Note:** Use legacy `ragas.metrics` API (not `ragas.metrics.collections`) for LangChain/Groq compatibility.
+
 ### Reset Database
 ```bash
 rm -rf chroma_db/
@@ -85,7 +120,15 @@ python ingest.py
 **app.py:**
 - `EMBEDDING_MODEL = "all-MiniLM-L6-v2"` - must match ingest.py
 - `GEMINI_MODEL = "gemini-flash-latest"`
-- `NUM_RESULTS = 5` - number of chunks retrieved
+- `NUM_RESULTS = 5` - final number of results returned
+- `RERANK_TOP_K = 10` - candidates for cross-encoder reranking
+- `CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"`
+
+**evaluation.py:**
+- `TEST_CASES = 3` - recipe queries for evaluation
+- `GROQ_MODEL = "llama-3.1-8b-instant"` - fast, free tier
+- `AnswerRelevancy(strictness=1)` - CRITICAL: Groq only supports n=1
+- Use `ragas.metrics` (legacy), NOT `ragas.metrics.collections`
 
 ### Environment Variables
 - `GOOGLE_API_KEY` - required for Gemini, stored in `.env` (gitignored)
@@ -141,6 +184,18 @@ HuggingFaceEmbeddings(
 **Problem:** Google Embedding API 429 errors
 **Solution:** Using local HuggingFace embeddings (already implemented)
 
+### RAGAS AnswerRelevancy with Groq
+**Problem:** `BadRequestError: 'n' : number must be at most 1`
+**Solution:** Use `AnswerRelevancy(strictness=1)` - Groq only supports n=1, but AnswerRelevancy generates N questions by default
+
+### RAGAS Collections Incompatibility
+**Problem:** `ValueError: Collections metrics only support modern InstructorLLM. Found: ChatGroq`
+**Solution:** Use legacy `ragas.metrics` API (not `ragas.metrics.collections`) - collections doesn't support LangChain wrappers
+
+### RAGAS Timeout Errors
+**Problem:** `TimeoutError()` during evaluation
+**Solution:** Increase `RunConfig(timeout=300)` and reduce `max_workers=2` to avoid rate limits
+
 ## Design Rationale
 
 ### Why Local Embeddings?
@@ -166,21 +221,28 @@ HuggingFaceEmbeddings(
 **Key packages (see requirements.txt for versions):**
 - `langchain` + integrations (core framework)
 - `chromadb` + `langchain-chroma` (vector store)
-- `sentence-transformers==3.0.1` (pinned for stability)
+- `sentence-transformers==3.0.1` (pinned for stability, includes cross-encoder)
 - `langchain-huggingface` (local embeddings)
 - `langchain-google-genai` (Gemini integration)
+- `langchain-groq` (Groq API for evaluation)
+- `rank-bm25` (BM25 keyword search)
+- `ragas` (RAG evaluation framework)
+- `datasets` (RAGAS dependency)
 - `streamlit` (web UI)
 - `pypdf` (PDF processing)
-- `tqdm` (progress bars)
 
-**Important:** `sentence-transformers` must be 3.0.1 to avoid PyTorch compatibility issues
+**Important:**
+- `sentence-transformers` must be 3.0.1 to avoid PyTorch compatibility issues
+- Use `ragas.metrics` (legacy API), not `ragas.metrics.collections` (requires InstructorLLM)
 
 ## File Purposes
 
-- `app.py`: Streamlit UI, vector search, Gemini integration, recipe formatting
+- `app.py`: Streamlit UI, hybrid search (BM25 + Semantic + RRF), cross-encoder reranking, Gemini integration
 - `ingest.py`: PDF validation, text extraction, chunking, embedding generation, ChromaDB storage
+- `evaluation.py`: RAGAS evaluation framework, tests 4 retrieval methods with 4 metrics
 - `requirements.txt`: Pinned dependencies
-- `.env`: API credentials (create manually, gitignored)
+- `EVALUATION_RESULTS.md`: RAGAS evaluation findings and recommendations
+- `.env`: API credentials (GOOGLE_API_KEY, GROQ_API_KEY - create manually, gitignored)
 - `data/`: PDF cookbook storage (gitignored)
 - `chroma_db/`: Vector database (gitignored)
 
@@ -219,11 +281,34 @@ print(f"Found {len(results)} results")
 
 ## Performance Characteristics
 
+### Speed
 - **Ingestion:** ~2s for 90-page PDF
-- **Query latency:** 2-5s (vector search + Gemini generation)
+- **Query latency:** 2-5s (search + generation), +200ms with reranking
 - **Storage:** ~3MB per cookbook
-- **Costs:** $0 embeddings, ~$0.0001 per query
-- **Free tier:** 1500 Gemini requests/day
+- **Evaluation:** ~35 minutes for 3 test cases × 4 methods
+
+### Quality (RAGAS Evaluation Results)
+| Method | Context Precision | Context Recall | Faithfulness | Answer Relevancy |
+|--------|-------------------|----------------|--------------|------------------|
+| **Hybrid + Reranking** | 66.8% | **100%** | 88.4% | **59.5%** ⭐ |
+| Hybrid (RRF) | 73.3% | **100%** | 88.6% | 53.4% |
+| Semantic Only | 79.6% | 93.3% | 86.1% | 58.7% |
+| BM25 Only | 60.2% | **100%** | 75.0% | 42.0% |
+
+**Key Findings:**
+- Cross-encoder reranking achieves **best answer relevancy** (59.5%, +6.1% vs basic hybrid)
+- Hybrid methods achieve **perfect recall** (100% - users won't miss recipes)
+- Trade-off: Lower precision (66.8%) but better final answer quality
+- **Recommendation**: Use Hybrid + Reranking for production
+
+See `EVALUATION_RESULTS.md` for detailed analysis.
+
+### Cost
+- **Embeddings:** $0 (local HuggingFace)
+- **Vector DB:** $0 (local ChromaDB)
+- **Generation:** ~$0.0001/query (Gemini free tier: 1500 req/day)
+- **Evaluation:** $0 (Groq free tier)
+- **Total:** **Free** for typical usage
 
 ## Future Considerations
 

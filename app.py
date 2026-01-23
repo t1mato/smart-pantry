@@ -51,6 +51,13 @@ NUM_RESULTS = 5
 BM25_WEIGHT = 0.4  # Keyword search weight
 SEMANTIC_WEIGHT = 0.6  # Semantic search weight
 
+# Cross-Encoder Reranking
+# Reranks top results using a more powerful model that understands query-document relationships
+# Model: ms-marco-MiniLM-L-6-v2 - trained on Microsoft MARCO passage ranking dataset
+# Trade-off: ~100ms latency increase for significantly better precision
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_TOP_K = 10  # Retrieve more candidates for reranking, return top NUM_RESULTS
+
 # Prompt template for recipe generation
 RECIPE_PROMPT_TEMPLATE = """
 You are a helpful cooking assistant. Based on the recipe context provided below,
@@ -129,6 +136,48 @@ def reciprocal_rank_fusion(results_list, k=60):
     # Sort by score (descending) and return documents
     sorted_docs = sorted(doc_scores.values(), key=lambda x: x[0], reverse=True)
     return [doc for score, doc in sorted_docs]
+
+
+def rerank_with_cross_encoder(query: str, documents: list, top_k: int = NUM_RESULTS):
+    """
+    Rerank documents using a cross-encoder model for improved precision.
+
+    Cross-encoders are more accurate than bi-encoders (embeddings) because they:
+    - Process query + document together (not separately)
+    - Capture fine-grained interactions between query and document
+    - Trained specifically on relevance ranking tasks
+
+    Trade-off: Slower than embeddings (~100ms for 10 docs) but much better accuracy.
+
+    Args:
+        query (str): User's search query
+        documents (list): List of Document objects to rerank
+        top_k (int): Number of top documents to return after reranking
+
+    Returns:
+        list: Top-k documents sorted by relevance score (highest first)
+    """
+    if not documents:
+        return []
+
+    # Lazy import to avoid loading model on startup
+    from sentence_transformers import CrossEncoder
+
+    # Load cross-encoder model (cached after first load)
+    cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+
+    # Create query-document pairs for scoring
+    pairs = [[query, doc.page_content] for doc in documents]
+
+    # Score all pairs (returns relevance scores)
+    scores = cross_encoder.predict(pairs)
+
+    # Combine scores with documents and sort by score (descending)
+    doc_score_pairs = list(zip(documents, scores))
+    doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
+
+    # Return top-k documents
+    return [doc for doc, score in doc_score_pairs[:top_k]]
 
 
 def initialize_vectorstore():
@@ -240,9 +289,12 @@ def initialize_llm():
     return llm
 
 
-def search_recipes_hybrid(bm25_retriever, semantic_retriever, ingredients, restrictions, num_results=NUM_RESULTS):
+def search_recipes_hybrid(bm25_retriever, semantic_retriever, ingredients, restrictions,
+                         num_results=NUM_RESULTS, use_reranking=False):
     """
     Search using hybrid retrieval (BM25 + Semantic with RRF fusion).
+
+    Optionally applies cross-encoder reranking for improved precision.
 
     Args:
         bm25_retriever: BM25 keyword retriever
@@ -250,6 +302,7 @@ def search_recipes_hybrid(bm25_retriever, semantic_retriever, ingredients, restr
         ingredients (str): User's available ingredients
         restrictions (str): Dietary restrictions
         num_results (int): Number of results to retrieve
+        use_reranking (bool): Whether to apply cross-encoder reranking
 
     Returns:
         list: List of Document objects with recipe chunks and metadata
@@ -266,8 +319,14 @@ def search_recipes_hybrid(bm25_retriever, semantic_retriever, ingredients, restr
     # Combine using Reciprocal Rank Fusion
     fused_results = reciprocal_rank_fusion([bm25_results, semantic_results])
 
-    # Return top num_results
-    return fused_results[:num_results]
+    # Apply cross-encoder reranking if enabled
+    if use_reranking:
+        # Get more candidates for reranking, then select top num_results
+        candidates = fused_results[:RERANK_TOP_K]
+        return rerank_with_cross_encoder(search_query, candidates, top_k=num_results)
+    else:
+        # Return top num_results directly
+        return fused_results[:num_results]
 
 
 def format_context(search_results):
@@ -375,6 +434,38 @@ def main():
             help="More results = more context but slower"
         )
 
+        st.divider()
+
+        # Cross-encoder reranking toggle
+        use_reranking = st.checkbox(
+            "🎯 Enable Cross-Encoder Reranking",
+            value=True,
+            help="Uses a more powerful model to rerank results for better precision. Adds ~100ms latency."
+        )
+
+        if use_reranking:
+            st.info(
+                "**Cross-Encoder is ON** ✅\n\n"
+                "Results are reranked using a specialized model "
+                "for improved relevance."
+            )
+
+        st.divider()
+
+        # Debug mode - retrieval only (no LLM)
+        debug_mode = st.checkbox(
+            "🔧 Debug Mode (Retrieval Only)",
+            value=False,
+            help="Show retrieved documents without calling Gemini API. Useful for testing retrieval quality without using API quota."
+        )
+
+        if debug_mode:
+            st.warning(
+                "**Debug Mode is ON** 🔧\n\n"
+                "Will show retrieved documents only (no recipe generation). "
+                "Use this to compare cross-encoder ON vs OFF without using API quota."
+            )
+
 
     # Initialize components
     try:
@@ -384,8 +475,12 @@ def main():
         with st.spinner("Initializing hybrid search (BM25 + Semantic + RRF)..."):
             bm25_retriever, semantic_retriever = initialize_hybrid_retriever(vectorstore)
 
-        with st.spinner("Initializing AI model..."):
-            llm = initialize_llm()
+        # Only initialize LLM if not in debug mode
+        if not debug_mode:
+            with st.spinner("Initializing AI model..."):
+                llm = initialize_llm()
+        else:
+            llm = None  # Not needed in debug mode
 
     except FileNotFoundError as e:
         st.error(f"❌ {e}")
@@ -433,40 +528,68 @@ def main():
             return
 
         # Show search status
-        with st.spinner("🔍 Searching cookbook database with hybrid search (BM25 + Semantic + RRF)..."):
+        search_message = "🔍 Searching cookbook database with hybrid search (BM25 + Semantic + RRF)"
+        if use_reranking:
+            search_message += " + Cross-Encoder Reranking"
+        search_message += "..."
+
+        with st.spinner(search_message):
             search_results = search_recipes_hybrid(
                 bm25_retriever,
                 semantic_retriever,
                 ingredients,
                 restrictions,
-                num_results=num_results
+                num_results=num_results,
+                use_reranking=use_reranking
             )
 
         if not search_results:
             st.warning("😔 No recipes found. Try different ingredients or add more cookbooks.")
             return
 
-        # Format context
-        context = format_context(search_results)
+        # Debug mode: Show retrieved documents only (no LLM generation)
+        if debug_mode:
+            st.divider()
+            st.header("🔍 Retrieved Recipe Chunks (Debug Mode)")
+            st.info(f"**Found {len(search_results)} relevant chunks**. Toggle cross-encoder ON/OFF to compare results.")
 
-        # Generate recipe
-        with st.spinner("🤖 Adapting recipe to your needs..."):
-            recipe = generate_recipe(llm, context, ingredients, restrictions)
-
-        # Display result
-        st.divider()
-        st.header("📖 Your Recipe")
-        st.markdown(recipe)
-
-        # Show retrieved context in expander
-        with st.expander("🔍 View Source Recipe Chunks"):
-            st.markdown("*These are the cookbook excerpts used to generate your recipe:*")
             for i, doc in enumerate(search_results, 1):
-                st.markdown(f"**Chunk {i}**")
-                st.markdown(f"*Source: {doc.metadata.get('source', 'Unknown')} "
-                          f"(Page {doc.metadata.get('page', 'Unknown')})*")
-                st.text(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
-                st.divider()
+                with st.container():
+                    st.markdown(f"### 📄 Rank #{i}")
+                    st.markdown(f"**Source:** {doc.metadata.get('source', 'Unknown')} (Page {doc.metadata.get('page', 'Unknown')})")
+                    st.markdown("**Content:**")
+                    st.text_area(
+                        f"Chunk {i}",
+                        doc.page_content,
+                        height=200,
+                        key=f"doc_{i}",
+                        label_visibility="collapsed"
+                    )
+                    st.divider()
+
+        # Normal mode: Generate recipe with LLM
+        else:
+            # Format context
+            context = format_context(search_results)
+
+            # Generate recipe
+            with st.spinner("🤖 Adapting recipe to your needs..."):
+                recipe = generate_recipe(llm, context, ingredients, restrictions)
+
+            # Display result
+            st.divider()
+            st.header("📖 Your Recipe")
+            st.markdown(recipe)
+
+            # Show retrieved context in expander
+            with st.expander("🔍 View Source Recipe Chunks"):
+                st.markdown("*These are the cookbook excerpts used to generate your recipe:*")
+                for i, doc in enumerate(search_results, 1):
+                    st.markdown(f"**Chunk {i}**")
+                    st.markdown(f"*Source: {doc.metadata.get('source', 'Unknown')} "
+                              f"(Page {doc.metadata.get('page', 'Unknown')})*")
+                    st.text(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
+                    st.divider()
 
 
 # ============================================================================

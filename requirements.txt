@@ -16,6 +16,12 @@ langchain-huggingface
 # LLM integration (for query/generation phase)
 langchain-google-genai
 
+# Local LLM for evaluation (unlimited usage)
+langchain-ollama
+
+# Groq API for fast evaluation (14,400 requests/day free)
+langchain-groq
+
 # Frontend
 streamlit
 
